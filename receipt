@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Pipe stdin to an MQTT topic using mosquitto_pub
+input=$(cat)
+if [[ -z $input ]]; then
+  exit 0
+fi
+mosquitto_pub -h mqtt_broker_ip -u myUsername -P myPassword -t "root_topic/receipt_printer/print_text" -m "$input"
+mosquitto_pub -h mqtt_broker_ip -u myUsername -P myPassword -t "root_topic/receipt_printer/print_text" -m ''
+mosquitto_pub -h mqtt_broker_ip -u myUsername -P myPassword -t "root_topic/receipt_printer/print_text" -m ''
+mosquitto_pub -h mqtt_broker_ip -u myUsername -P myPassword -t "root_topic/receipt_printer/print_text" -m ''

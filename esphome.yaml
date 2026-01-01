@@ -1,0 +1,688 @@
+esphome:
+  name: receipt-printer
+  friendly_name: receipt-printer
+  name_add_mac_suffix: false
+
+esp32:
+  board: esp32-c6-devkitm-1
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+
+ota:
+  - platform: esphome
+    password: "<snip>"
+
+
+# https://circuitdigest.com/microcontroller-projects/how-to-interface-thermal-printer-with-esp32
+# https://github.com/lyntoo/Home-Assistant/blob/636b3d24bd72432fa428efdb832b99ee961696cb/esphome/thermalprinter/esphome_thermal_printer.yaml
+# https://github.com/adafruit/Adafruit-Thermal-Printer-Library/blob/master/Adafruit_Thermal.cpp
+
+globals:
+  - id: uart_write_buffer
+    type: std::vector<uint8_t>
+    restore_value: no
+  - id: rts_on
+    type: bool
+
+mqtt:
+  broker: !secret mqtt_hostname
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  discovery: false
+  topic_prefix: null
+  on_message:
+    - topic: root_topic/receipt_printer/print_text
+      then:
+        - lambda: |-
+            id(uart_write_buffer).push_back(0x1B);
+            id(uart_write_buffer).push_back(0x40);
+            for (int i = 0; i < x.size(); i++) {
+              id(uart_write_buffer).push_back(x[i]);
+            }
+            id(uart_write_buffer).push_back('\n');
+    - topic: root_topic/receipt_printer/print_bitmap
+      then:
+        - lambda: |-
+            int maxChunkHeight = 255;
+            int rowBytes, rowBytesClipped, rowStart, chunkHeight, chunkHeightLimit, ix, iy, i;
+            char const *bitmap = x.data();
+            int h = 384;
+            int w = 384;
+
+            rowBytes = (w + 7) / 8; // Round up to next byte boundary
+            rowBytesClipped = (rowBytes >= 48) ? 48 : rowBytes; // 384 pixels max width
+
+            chunkHeightLimit = 256 / rowBytesClipped;
+            if (chunkHeightLimit > maxChunkHeight)
+              chunkHeightLimit = maxChunkHeight;
+            else if (chunkHeightLimit < 1)
+              chunkHeightLimit = 1;
+
+            for (i = rowStart = 0; rowStart < h; rowStart += chunkHeightLimit) {
+              // Issue up to chunkHeightLimit rows at a time:
+              chunkHeight = h - rowStart;
+              if (chunkHeight > chunkHeightLimit)
+                chunkHeight = chunkHeightLimit;
+
+              id(uart_write_buffer).push_back(18);
+              id(uart_write_buffer).push_back('*');
+              id(uart_write_buffer).push_back(chunkHeight);
+              id(uart_write_buffer).push_back(rowBytesClipped);
+
+              for (iy = 0; iy < chunkHeight; iy++) {
+                for (ix = 0; ix < rowBytesClipped; ix++, i++) {
+                  id(uart_write_buffer).push_back(~(*(bitmap + i)));
+                }
+                i += rowBytes - rowBytesClipped;
+              }
+            }
+            id(uart_write_buffer).push_back(0x1B); // Reset styles
+            id(uart_write_buffer).push_back(0x40);
+            id(uart_write_buffer).push_back(0x0A); // Line feed
+            id(uart_write_buffer).push_back(0x0A); // Line feed
+            id(uart_write_buffer).push_back(0x0A); // Line feed
+
+wifi:
+  ssid: !secret wifi_ssid_2
+  password: !secret wifi_password_2
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO1
+      inverted: true
+      mode:
+        pullup: true
+        input: true
+
+    name: "Button"
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      - mqtt.publish:
+          topic: root_topic/receipt_printer/button
+          payload: '1'
+
+interval:
+  - interval: 10s
+    then:
+      - mqtt.publish:
+          topic: root_topic/receipt_printer/heartbeat
+          payload: !lambda |
+            auto now = id(homeassistant_time).now();
+            if (now.is_valid()) {
+              char buffer[100];
+              snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02dZ", 
+                       now.year, now.month, now.day_of_month, now.hour, now.minute, now.second);
+              return std::string(buffer);
+            }
+            return "1";
+  - interval: 1ms
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(uart_write_buffer).size() > 0;
+          then:
+            - if:
+                condition:
+                  lambda: |-
+                    return !id(rts_on);
+                then:
+                  - output.turn_on: printer_rts_pin
+                  - lambda: |-
+                      id(rts_on) = true;
+                  - logger.log: "Turning on RTS"
+                  - delay: 100ms
+
+            - lambda: |-
+                int byte_count = min(32, (int)id(uart_write_buffer).size());
+                id(thermal_uart).write_array(id(uart_write_buffer).data(), byte_count);
+                id(uart_write_buffer).erase(id(uart_write_buffer).begin(), id(uart_write_buffer).begin()+byte_count);
+          else:
+            - if:
+                condition:
+                  lambda: |-
+                    return id(rts_on);
+                then:
+                  - output.turn_off: printer_rts_pin
+                  - logger.log: "Turning off RTS"
+                  - lambda: |-
+                      id(rts_on) = false;
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "<snip>"
+
+  actions:
+    # Action to print simple text
+    - action: print_text
+      variables:
+        message: string
+      then:
+        - output.turn_on: printer_rts_pin
+        - delay: 100ms
+        - uart.write:
+            id: thermal_uart
+            data: [0x1B, 0x40]  # ESC @ - Initialize printer
+        - uart.write:
+            id: thermal_uart
+            data: !lambda |
+              std::string text = message + "\n\n\n";
+              std::vector<uint8_t> data(text.begin(), text.end());
+              return data;
+
+    # Action to print centered text
+    - action: print_centered
+      variables:
+        message: string
+      then:
+        - output.turn_on: printer_rts_pin
+        - delay: 100ms
+        - uart.write:
+            id: thermal_uart
+            data: [0x1B, 0x40]  # Initialize
+        - uart.write:
+            id: thermal_uart
+            data: [0x1B, 0x61, 0x01]  # Center text
+        - uart.write:
+            id: thermal_uart
+            data: !lambda |
+              std::string text = message + "\n";
+              std::vector<uint8_t> data(text.begin(), text.end());
+              return data;
+        - uart.write:
+            id: thermal_uart
+            data: [0x1B, 0x61, 0x00]  # Return to left alignment
+
+    # Action to print in large characters
+    - action: print_large
+      variables:
+        message: string
+      then:
+        - output.turn_on: printer_rts_pin
+        - delay: 100ms
+        - uart.write:
+            id: thermal_uart
+            data: [0x1B, 0x40]  # Initialize
+        - uart.write:
+            id: thermal_uart
+            data: [0x1D, 0x21, 0x11]  # Double width and height size
+        - uart.write:
+            id: thermal_uart
+            data: !lambda |
+              std::string text = message + "\n";
+              std::vector<uint8_t> data(text.begin(), text.end());
+              return data;
+        - uart.write:
+            id: thermal_uart
+            data: [0x1D, 0x21, 0x00]  # Return to normal size
+
+    # Paper feed action
+    - action: feed_paper
+      variables:
+        lines: int
+      then:
+        - uart.write:
+            id: thermal_uart
+            data: !lambda |
+              std::vector<uint8_t> data;
+              for(int i = 0; i < lines; i++) {
+                data.push_back(0x0A); // Line feed
+              }
+              return data;
+
+    # New action to print a QR code
+    - action: print_qr_code
+      variables:
+        data_to_encode: string # The string data (e.g., URL, text) to encode in the QR code
+        module_size: int   # Size of QR code dots (1-16, default 8). Larger number = larger QR.
+        error_correction: int # Optional: Error correction level (0=L, 1=M, 2=Q, 3=H). Default L.
+                               # Higher level = more robust QR, but larger size.
+      then:
+        - output.turn_on: printer_rts_pin
+        - delay: 100ms
+        - uart.write:
+            id: thermal_uart
+            data: [0x1B, 0x40]  # Initialize printer (resets all styles)
+        - uart.write:
+            id: thermal_uart
+            data: !lambda |
+              // QR Code commands (ESC/POS compatible)
+              // This sequence is common for many generic thermal printers.
+              // Please check your printer's specific ESC/POS command manual for exact details.
+
+              // 1. Set module size (dot size of the QR code)
+              // GS ( k P L P H cn fn m
+              // fn=0x31 (function 1), m=0x43 (for setting module size)
+              int size = 8; // Default module size
+              // Check if module_size was provided (i.e., not 0, and within a valid range)
+              // Home Assistant sends 0 if optional int is not provided.
+              if (module_size >= 1 && module_size <= 16) {
+                  size = module_size;
+              }
+              std::vector<uint8_t> set_size_cmd = {0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x43, (uint8_t)size};
+
+              // 2. Set error correction level
+              // GS ( k P L P H cn fn n
+              // fn=0x31 (function 1), n=0x45 (for setting error correction level)
+              // Level: 0=L (7%), 1=M (15%), 2=Q (25%), 3=H (30%)
+              int level = 0; // Default L (Lowest error correction, smallest QR code)
+              // Check if error_correction was provided (i.e., not 0 for L, and within a valid range)
+              // Note: If 0 is a valid input for 'L' level, we only check for 0-3 range.
+              if (error_correction >=0 && error_correction <= 3) {
+                  level = error_correction;
+              }
+              std::vector<uint8_t> set_ecc_cmd = {0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x45, (uint8_t)level};
+
+              // 3. Store the data in the QR code buffer
+              // GS ( k P L P H cn fn m d1...dk
+              // fn=0x31 (function 1), m=0x50 (for storing data), n=0x30 (data type for QR code)
+              std::vector<uint8_t> data_bytes(data_to_encode.begin(), data_to_encode.end());
+              uint16_t data_len = data_bytes.size();
+              uint16_t total_len_for_store = data_len + 3; // +3 for the 0x31 0x50 0x30 part
+              uint8_t len_L = total_len_for_store & 0xFF;
+              uint8_t len_H = (total_len_for_store >> 8) & 0xFF;
+
+              std::vector<uint8_t> store_data_cmd = {
+                  0x1D, 0x28, 0x6B, len_L, len_H, 0x31, 0x50, 0x30
+              };
+              store_data_cmd.insert(store_data_cmd.end(), data_bytes.begin(), data_bytes.end());
+
+              // 4. Set alignment to center
+              std::vector<uint8_t> center_align_cmd = {0x1B, 0x61, 0x01}; // ESC a 1 - Center alignment
+
+              // 5. Print the QR Code from the buffer
+              // GS ( k P L P H cn fn m
+              // fn=0x31 (function 1), m=0x51 (for printing), n=0x30 (data type for QR code)
+              std::vector<uint8_t> print_qr_cmd = {0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x51, 0x30};
+
+              // Combine all commands
+              std::vector<uint8_t> full_cmd;
+              full_cmd.insert(full_cmd.end(), set_size_cmd.begin(), set_size_cmd.end());
+              full_cmd.insert(full_cmd.end(), set_ecc_cmd.begin(), set_ecc_cmd.end());
+              full_cmd.insert(full_cmd.end(), store_data_cmd.begin(), store_data_cmd.end());
+              full_cmd.insert(full_cmd.end(), center_align_cmd.begin(), center_align_cmd.end()); // Insert center command here
+              full_cmd.insert(full_cmd.end(), print_qr_cmd.begin(), print_qr_cmd.end());
+              full_cmd.push_back(0x0A); // Line feed after QR for spacing
+              full_cmd.push_back(0x0A); // Additional line feeds for separation
+              full_cmd.push_back(0x0A);
+              return full_cmd;
+
+
+    # Action to set text alignment
+    - action: set_alignment
+      variables:
+        alignment: string # "left", "center", "right"
+      then:
+        - output.turn_on: printer_rts_pin
+        - delay: 100ms
+        - uart.write:
+            id: thermal_uart
+            data: !lambda |
+              std::vector<uint8_t> commands = {0x1B, 0x61}; // ESC a
+              std::string align_type = alignment;
+              std::transform(align_type.begin(), align_type.end(), align_type.begin(), ::tolower);
+
+              if (align_type == "left") {
+                  commands.push_back(0x00);
+              } else if (align_type == "center") {
+                  commands.push_back(0x01);
+              } else if (align_type == "right") {
+                  commands.push_back(0x02);
+              } else {
+                  commands.push_back(0x00); // Default to left if unknown
+              }
+              return commands;
+
+    # Action to print text with styles
+    - action: print_styled_text
+      variables:
+        message: string
+        bold: bool
+        underline: bool
+        text_size: int # 0=normal, 1=double_width, 2=double_height, 3=double_all (or 0x00, 0x01, 0x10, 0x11 as hex values for 'n')
+      then:
+        - output.turn_on: printer_rts_pin
+        - delay: 100ms
+        - uart.write:
+            id: thermal_uart
+            data: [0x1B, 0x40]  # Initialize printer (resets all styles)
+        - uart.write:
+            id: thermal_uart
+            data: !lambda |
+              std::vector<uint8_t> commands;
+              // Set Bold
+              if (bold) {
+                  commands.push_back(0x1B); // ESC
+                  commands.push_back(0x45); // E
+                  commands.push_back(0x01); // Enable Bold
+              } else {
+                  commands.push_back(0x1B); // ESC
+                  commands.push_back(0x45); // E
+                  commands.push_back(0x00); // Disable Bold
+              }
+
+              // Set Underline
+              if (underline) {
+                  commands.push_back(0x1B); // ESC
+                  commands.push_back(0x2D); // -
+                  commands.push_back(0x01); // Enable Underline (1-dot thickness)
+              } else {
+                  commands.push_back(0x1B); // ESC
+                  commands.push_back(0x2D); // -
+                  commands.push_back(0x00); // Disable Underline
+              }
+
+              // Set Text Size
+              uint8_t size_command = 0x00; // Normal size by default
+              if (text_size == 1) { // Double width
+                  size_command = 0x01;
+              } else if (text_size == 2) { // Double height
+                  size_command = 0x10;
+              } else if (text_size == 3) { // Double width & height
+                  size_command = 0x11;
+              }
+              // For other sizes (e.g., 3x3, 4x4), you'd need to map more values
+              // Check your printer manual for supported GS ! n values (e.g., 0x22 for 3x3 etc.)
+              commands.push_back(0x1D); // GS
+              commands.push_back(0x21); // !
+              commands.push_back(size_command); // Size byte
+
+              // Add the message
+              std::vector<uint8_t> message_bytes(message.begin(), message.end());
+              commands.insert(commands.end(), message_bytes.begin(), message_bytes.end());
+              
+              commands.push_back(0x0A); // Line feed
+
+              // Reset all styles after printing for safety (or initialize printer again)
+              // You can re-initialize the printer if you want to ensure all styles are off
+              // commands.push_back(0x1B); commands.push_back(0x40); // ESC @ Initialize
+
+              commands.push_back(0x0A); // Add extra line feeds for spacing
+              commands.push_back(0x0A);
+              return commands;
+
+    # Action to set inverted mode (white on black)
+    - action: set_inverted_mode
+      variables:
+        enabled: bool
+      then:
+        - output.turn_on: printer_rts_pin
+        - delay: 100ms
+        - uart.write:
+            id: thermal_uart
+            data: !lambda |
+              std::vector<uint8_t> commands = {0x1D, 0x42}; // GS B
+              if (enabled) {
+                  commands.push_back(0x01); // Enable
+              } else {
+                  commands.push_back(0x00); // Disable
+              }
+              return commands;
+
+    # Action to set upside down mode (rotate 180°)
+    - action: set_upside_down_mode
+      variables:
+        enabled: bool
+      then:
+        - output.turn_on: printer_rts_pin
+        - delay: 100ms
+        - uart.write:
+            id: thermal_uart
+            data: !lambda |
+              std::vector<uint8_t> commands = {0x1B, 0x7B}; // ESC {
+              if (enabled) {
+                  commands.push_back(0x01); // Enable
+              } else {
+                  commands.push_back(0x00); // Disable
+              }
+              return commands;
+
+    # Action to set line spacing (in dots)
+    - action: set_line_spacing
+      variables:
+        dots: int # Number of dots for line spacing (0 to 255). 0 often means default.
+      then:
+        - output.turn_on: printer_rts_pin
+        - delay: 100ms
+        - uart.write:
+            id: thermal_uart
+            data: !lambda |
+              std::vector<uint8_t> commands = {0x1B, 0x33, (uint8_t)dots}; // ESC 3 n
+              return commands;
+
+    # Action to print a 1D Barcode
+    - action: print_barcode
+      variables:
+        data_to_encode: string # The data for the barcode (e.g., product code)
+        barcode_type: string # "EAN13", "CODE39", "CODE128", etc. (case-insensitive)
+        height: int      # Optional: Height of the barcode in dots (default 80)
+        width_module: int # Optional: Width of the thinnest bar in dots (2-6, default 3)
+        hri_position: string # Optional: Position of Human Readable Interpretation (HRI) characters: "none", "above", "below", "both"
+      then:
+        - output.turn_on: printer_rts_pin
+        - delay: 100ms
+        - uart.write:
+            id: thermal_uart
+            data: [0x1B, 0x40]  # Initialize printer (resets styles)
+        - uart.write:
+            id: thermal_uart
+            data: !lambda |
+              std::vector<uint8_t> commands;
+
+              // 1. Set HRI (Human Readable Interpretation) characters position
+              // GS H n (0x1D 0x48 n)
+              uint8_t hri_pos_byte = 0x02; // Default: below
+              std::string hri = hri_position;
+              // If hri_position is empty or invalid, default to "below" (0x02)
+              if (!hri.empty()) { // Only process if a string was actually provided
+                  std::transform(hri.begin(), hri.end(), hri.begin(), ::tolower);
+                  if (hri == "none") {
+                      hri_pos_byte = 0x00;
+                  } else if (hri == "above") {
+                      hri_pos_byte = 0x01;
+                  } else if (hri == "below") {
+                      hri_pos_byte = 0x02;
+                  } else if (hri == "both") {
+                      hri_pos_byte = 0x03;
+                  }
+              }
+              commands.push_back(0x1D); commands.push_back(0x48); commands.push_back(hri_pos_byte);
+
+              // 2. Set barcode height
+              // GS h n (0x1D 0x68 n)
+              uint8_t bar_height = 80; // Default height
+              if (height >= 1 && height <= 255) { // Check if height was provided and is valid
+                  bar_height = (uint8_t)height;
+              }
+              commands.push_back(0x1D); commands.push_back(0x68); commands.push_back(bar_height);
+
+              // 3. Set barcode width module (width of narrowest bar)
+              // GS w n (0x1D 0x77 n)
+              uint8_t bar_width = 3; // Default width
+              if (width_module >= 2 && width_module <= 6) { // Check if width_module was provided and is valid
+                  bar_width = (uint8_t)width_module;
+              }
+              commands.push_back(0x1D); commands.push_back(0x77); commands.push_back(bar_width);
+
+              // Add command to center alignment
+              commands.push_back(0x1B); commands.push_back(0x61); commands.push_back(0x01); // ESC a 1 - Center alignment
+
+              // 4. Print the barcode
+              // GS k m d1...dk NUL (or GS k m k d1...dk)
+
+              std::string type_str = barcode_type;
+              std::transform(type_str.begin(), type_str.end(), type_str.begin(), ::toupper); // Convert to uppercase
+
+              std::vector<uint8_t> barcode_data_bytes(data_to_encode.begin(), data_to_encode.end());
+              uint8_t barcode_type_byte = 0x00; // Default to unknown type
+
+              if (type_str == "EAN13" && barcode_data_bytes.size() == 12) { // 12 digits for EAN13 (13th is checksum)
+                  barcode_type_byte = 0x04; // EAN13
+                  commands.push_back(0x1D); commands.push_back(0x6B); commands.push_back(barcode_type_byte);
+                  commands.insert(commands.end(), barcode_data_bytes.begin(), barcode_data_bytes.end());
+                  // EAN13 ends implicitly, no NUL needed for this mode
+              } else if (type_str == "EAN8" && barcode_data_bytes.size() == 7) { // 7 digits for EAN8
+                  barcode_type_byte = 0x05; // EAN8
+                  commands.push_back(0x1D); commands.push_back(0x6B); commands.push_back(barcode_type_byte);
+                  commands.insert(commands.end(), barcode_data_bytes.begin(), barcode_data_bytes.end());
+              } else if (type_str == "CODE39") { // Arbitrary length, usually alphanumeric
+                  barcode_type_byte = 0x08; // CODE39
+                  commands.push_back(0x1D); commands.push_back(0x6B); commands.push_back(barcode_type_byte);
+                  commands.insert(commands.end(), barcode_data_bytes.begin(), barcode_data_bytes.end());
+                  commands.push_back(0x00); // NUL terminator for CODE39
+              } else if (type_str == "CODE128") { // Complex, requires specific data formatting for subsets
+                  // CODE128 (Type 73 / 0x49) requires length byte before data
+                  barcode_type_byte = 0x49; // CODE128 (GS k 73 k d1...dk)
+                  commands.push_back(0x1D); commands.push_back(0x6B); commands.push_back(barcode_type_byte);
+                  commands.push_back(barcode_data_bytes.size()); // k = length of data
+                  commands.insert(commands.end(), barcode_data_bytes.begin(), barcode_data_bytes.end());
+              } else {
+                  // If barcode_type is not recognized or data length is incorrect, print an error message
+                  std::string error_msg = "Invalid barcode type or data length for type " + type_str + ": " + data_to_encode + "\n";
+                  std::vector<uint8_t> error_bytes(error_msg.begin(), error_msg.end());
+                  commands.insert(commands.end(), error_bytes.begin(), error_bytes.end());
+              }
+
+              commands.push_back(0x0A); // Line feed after barcode
+              commands.push_back(0x0A); // Additional line feeds for spacing
+              commands.push_back(0x0A);
+              return commands;
+
+# UART configuration for the thermal printer
+uart:
+  id: thermal_uart
+  tx_pin: GPIO2  # Connected to printer's RX
+  rx_pin: GPIO8  # Connected to printer's TX
+  baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+
+# Control pin for the printer (Printer's RTS)
+# Used to signal 'ready' or 'wake up' the printer.
+output:
+  - platform: ledc
+    pin: GPIO7 # ESP32 GPIO3 <--- connects to ---> Printer RTS
+    id: printer_rts_pin # Renamed to be more explicit 
+
+# Test button
+button:
+  - platform: template
+    name: "Test Print"
+    on_press:
+      - output.turn_on: printer_rts_pin
+      - delay: 100ms
+      - uart.write:
+          id: thermal_uart
+          data: [0x1B, 0x40]  # Initialize
+      - uart.write:
+          id: thermal_uart
+          data: [0x1B, 0x61, 0x01]  # Center
+      - uart.write:
+          id: thermal_uart
+          data: [0x1D, 0x21, 0x11]  # Double size
+      - uart.write:
+          id: thermal_uart
+          data: !lambda |
+            std::string text = "PRINTER TEST\n";
+            std::vector<uint8_t> data(text.begin(), text.end());
+            return data;
+      - uart.write:
+          id: thermal_uart
+          data: [0x1D, 0x21, 0x00]  # Normal size
+      - uart.write:
+          id: thermal_uart
+          data: [0x1B, 0x61, 0x00]  # Left alignment
+      - uart.write:
+          id: thermal_uart
+          data: !lambda |
+            auto now = id(homeassistant_time).now();
+            if (now.is_valid()) {
+              char buffer[100];
+              snprintf(buffer, sizeof(buffer), "Date: %02d/%02d/%04d %02d:%02d:%02d\n", 
+                       now.day_of_month, now.month, now.year, now.hour, now.minute, now.second);
+              std::string text = std::string(buffer) + "Printer connected!\nESP32-C3 Super Mini\n\n\n";
+              std::vector<uint8_t> data(text.begin(), text.end());
+              return data;
+            } else {
+              std::string text = "Printer connected!\nESP32-C3 Super Mini\n\n\n";
+              std::vector<uint8_t> data(text.begin(), text.end());
+              return data;
+            }
+
+
+# Status LED (if available on your ESP32-S3)
+
+# light:
+#   - platform: neopixelbus
+#     type: RGB
+#     variant: WS2812
+#     pin: GPIO20
+#     num_leds: 1
+#     name: "Status Led"
+#     id: rgb_light
+#     restore_mode: ALWAYS_OFF
+
+# select:
+#   - platform: template
+#     name: "Status Led Color Preset"
+#     optimistic: true
+#     options:
+#       - "Off"
+#       - "Red"
+#       - "Green"
+#       - "Blue"
+#     initial_option: "Off"
+#     on_value:
+#       then:
+#         - if:
+#             condition:
+#               lambda: 'return x == "Red";'
+#             then:
+#               - light.turn_on:
+#                   id: rgb_light
+#                   red: 1.0
+#                   green: 0.0
+#                   blue: 0.0
+#         - if:
+#             condition:
+#               lambda: 'return x == "Green";'
+#             then:
+#               - light.turn_on:
+#                   id: rgb_light
+#                   red: 0.0
+#                   green: 1.0
+#                   blue: 0.0
+#         - if:
+#             condition:
+#               lambda: 'return x == "Blue";'
+#             then:
+#               - light.turn_on:
+#                   id: rgb_light
+#                   red: 0.0
+#                   green: 0.0
+#                   blue: 1.0         
+#         - if:
+#             condition:
+#               lambda: 'return x == "Off";'
+#             then:
+#               - light.turn_off: rgb_light
+
+
+# Time configuration
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+# WiFi Sensor
+sensor:
+  - platform: wifi_signal
+    name: "Printer WiFi Signal"
+    update_interval: 60s
