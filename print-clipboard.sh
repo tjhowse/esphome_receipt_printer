@@ -22,15 +22,15 @@ if [[ -z $clipboard ]]; then
         mosquitto_pub -h mqtt_broker_ip -u myUsername -P myPassword -t "root_topic/receipt_printer/print_text" -m ""
         mosquitto_pub -h mqtt_broker_ip -u myUsername -P myPassword -t "root_topic/receipt_printer/print_text" -m ""
         mosquitto_pub -h mqtt_broker_ip -u myUsername -P myPassword -t "root_topic/receipt_printer/print_text" -m ""
-        notify-send "Receipt Printer" "Printed clipboard content (image)."
+        notify-send -e "Receipt Printer" "Printed clipboard content (image)."
         exit 0
     fi
-    notify-send "Receipt Printer" "Clipboard is empty, not printing."
+    notify-send -e "Receipt Printer" "Clipboard is empty, not printing."
     exit 0
 fi
 # If the clipboard contains more than 500 characters, don't print it
 if [[ ${#clipboard} -gt 1000 ]]; then
-    notify-send "Receipt Printer" "Clipboard content is too long (${#clipboard} characters), not printing."
+    notify-send -e "Receipt Printer" "Clipboard content is too long (${#clipboard} characters), not printing."
     exit 0
 fi
 # For each line in the clipboard
@@ -42,4 +42,4 @@ done <<< "$clipboard"
 mosquitto_pub -h mqtt_broker_ip -u myUsername -P myPassword -t "root_topic/receipt_printer/print_text" -m ""
 mosquitto_pub -h mqtt_broker_ip -u myUsername -P myPassword -t "root_topic/receipt_printer/print_text" -m ""
 mosquitto_pub -h mqtt_broker_ip -u myUsername -P myPassword -t "root_topic/receipt_printer/print_text" -m ""
-notify-send "Receipt Printer" "Printed clipboard content (${#clipboard} characters)."
+notify-send -e "Receipt Printer" "Printed clipboard content (${#clipboard} characters)."
